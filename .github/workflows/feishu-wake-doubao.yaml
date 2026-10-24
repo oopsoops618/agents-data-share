@@ -1,0 +1,83 @@
+name: feishu-wake-doubao
+
+# PR 评论 / 评审 / 行内评论中出现豆包标签时，推送到飞书调度群机器人，
+# 由飞书「消息到达」事件任务实时唤醒豆包接单。
+# 豆包回评首行是 [claude-oops618]，不命中豆包标签，不会回环。
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  wake-doubao:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Forward tagged PR comment to Feishu
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_BOT_WEBHOOK }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.request
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
+              ev = json.load(f)
+
+          name = os.environ.get("GITHUB_EVENT_NAME", "")
+          repo = ev["repository"]["full_name"]
+
+          if name == "issue_comment":
+              issue = ev.get("issue", {})
+              if not issue.get("pull_request"):
+                  print("普通 issue 评论，忽略")
+                  sys.exit(0)
+              number = issue["number"]
+              c = ev["comment"]
+              etype = "PR评论"
+          elif name == "pull_request_review":
+              number = ev["pull_request"]["number"]
+              c = ev["review"]
+              etype = "PR评审"
+          elif name == "pull_request_review_comment":
+              number = ev["pull_request"]["number"]
+              c = ev["comment"]
+              etype = "行内评论"
+          else:
+              sys.exit(0)
+
+          body = c.get("body") or ""
+          user = c["user"]["login"]
+          url = c["html_url"]
+
+          if not re.search(r"\[doubao-oops618\]|\[给豆包\]|\[toDoubao-oops618\]", body):
+              print("未命中豆包标签，跳过")
+              sys.exit(0)
+
+          text = (
+              "[toDoubao-oops618] 豆包新任务唤醒\n"
+              f"仓库：{repo}\n"
+              f"PR：#{number}\n"
+              f"类型：{etype}\n"
+              f"评论人：{user}\n"
+              f"PR链接：https://github.com/{repo}/pull/{number}\n"
+              f"评论链接：{url}\n"
+              "评论正文：\n"
+              f"{body}"
+          )
+
+          payload = json.dumps({"msg_type": "text", "content": {"text": text}}).encode("utf-8")
+          req = urllib.request.Request(
+              os.environ["FEISHU_WEBHOOK"],
+              data=payload,
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(req, timeout=15) as resp:
+              print("飞书响应：", resp.read().decode())
+          PY

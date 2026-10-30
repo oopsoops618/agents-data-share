@@ -1,65 +1,52 @@
 # Gemini 跨账号向指定 Google Drive 共享文件夹归档图片/文件工作流指南
 
-本文档说明如何利用 **个人网盘根目录暂存 (`drive:create_file`) + `GitHub_Task_Queue` 队列 (`COPY_TO_DRIVE` 动作)**，由后台 Apps Script 每分钟定时巡检并将无损 PNG 图片或任意文件自动归档至指定的 Google Drive 共享文件夹（如 `CDS工作室` 或任何其他协作目录）。
+本文档提供两种将 Gemini 生成的无损 PNG / JPG 图片或文档自动归档至任意 Google Drive 共享文件夹（如 `CDS工作室`）的工作流：
+- **模式 A（极简推荐：文件名暗号法 / 零表格写入）**：Gemini **只负责把带前缀名的图片传到个人网盘根目录，不调用任何写表格工具**，彻底避开 `sheets_agent` 的确认卡片！
+- **模式 B（表格队列法：`COPY_TO_DRIVE`）**：适合在主账号（表格唯一所有者）下统一调度，或把表格在各账号下独立复制一份使用。
 
 ---
 
-## 一、核心工作流设计（个人网盘根目录中转法）
+## 一、模式 A：文件名暗号法（零表格写入，彻底无确认卡）
 
-无需手动转换 Base64，原生支持任意大小的无损 `.png`、`.jpg`、`.webp`、`.pdf` 等文件：
+### 1. 原理说明
+实测表明，Gemini 调用 `drive:create_file`（不填 `parent_id`）将图片上传至**当前账号自己的个人网盘根目录**时，不会触发任何确认卡片；唯一触发「共享电子表格的建议编辑」卡片的是第二步调用 `sheets_agent` 修改多人共享表格。
 
-1. **上传至个人网盘根目录（获取 `file_id`）**：
-   - Gemini 在沙箱中生成图片或文件（如 `creative_cat.png`）。
-   - 调用 `drive:create_file`（传入 `base64_content: "file:///沙箱路径/creative_cat.png"`, `mime_type: "image/png"`, `title: "creative_cat.png"`），**不填写 `parent_id`**（默认直接存入当前账号自己的网盘根目录，不直接写入外部他人共享文件夹），记录返回的 **`file_id`**。
-2. **向 `GitHub_Task_Queue` 提交 `COPY_TO_DRIVE` 任务**：
-   - 在 [GitHub_Task_Queue (外部读写任务队列)](https://docs.google.com/spreadsheets/d/1bb8k0iL4HtazsYZFo65ithcxTg21BINO5_RJ5dIdnoE/edit) 的 `Queue` 表末尾追加一行 `PENDING` 任务：
-     - `action`: 填 **`COPY_TO_DRIVE`**
-     - `method`: 填 **`PUT`**
-     - `path_or_endpoint`: 填**目标共享文件夹的 Folder ID**（通用设计，不限于 CDS；例如 `CDS工作室` 为 `19w2sIfrgC_bgGZRfRzMnebwe1pRjzcm_`）
-     - `commit_or_title`: 填**目标保存文件名**（如 `creative_cat.png`）
-     - `payload_json`: 填 **`drive:<刚才拿到的file_id>`**（若希望复制后在个人网盘根目录也保留一份原文件，可填 `drive_keep:<file_id>`）
-3. **Apps Script 每分钟巡检复制并自动清理根目录**：
-   - 后台定时器扫描到 `COPY_TO_DRIVE` 任务后，通过 `DriveApp.getFileById(fileId).makeCopy(fileName, targetFolder)` 将无损原文件直接复制到目标共享文件夹。
-   - 复制成功后，脚本会自动将个人网盘根目录下的临时暂存文件移入回收站（`setTrashed(true)`），保持个人网盘根目录整洁，并将共享文件夹中新文件的 `file_id` 与 `view_url` 回写到 `response_data`。
+因此，直接省去“写表格”这一步：
+1. **Gemini 仅上传文件并带上暗号前缀**：
+   - 归档到 `CDS工作室`：将上传文件名命名为 **`[TO_CDS] 文件名.png`**（例如 `[TO_CDS] sleeping_astronaut_cat.png`）。
+   - 归档到任意其他共享文件夹：将上传文件名命名为 **`[TO_DRIVE_<目标文件夹ID>] 文件名.png`**（例如 `[TO_DRIVE_19w2sIfrgC_bgGZRfRzMnebwe1pRjzcm_] cat.png`）。
+2. **后台脚本每分钟自动巡检**：
+   - Apps Script 的 `scanDriveTaggedFiles()` 每分钟自动搜索网盘中名字含 `[TO_` 的文件；
+   - 自动剥离 `[TO_...]` 前缀，将无损原图复制到对应共享文件夹，自动清理个人网盘根目录下的临时文件，并在 `Queue` 表末尾补一行 `AUTO-xxxxxx` 的 `DONE` 归档日志。
 
----
+### 2. 模式 A 标准提示词模板（推荐日常直接使用）
 
-## 二、`COPY_TO_DRIVE` 支持的来源格式 (`payload_json`)
-
-| 优先级 | 来源模式 | `payload_json` 填写格式 | 适用场景说明 |
-| :---: | :--- | :--- | :--- |
-| **首选** | **个人网盘根目录文件 ID** | `drive:<file_id>`（自动清理根目录暂存）或 `drive_keep:<file_id>`（保留原文件） | **无需转 Base64**，支持任意大小的无损 PNG / 高清大图与各类文档 |
-| 备选 1 | **外部或 GitHub Raw URL** | `https://...` | 直接将网络图片或已上传到 GitHub 的 Raw 图片转存至目标共享网盘文件夹 |
-| 备选 2 | **Gmail 草稿中转** | `draft:<draft_id>` 或 `draft:latest` | 兼容通过 Gmail 草稿正文传输小体积 Base64 数据的场景，转存后自动删除草稿 |
-| 备选 3 | **单元格内联 Base64** | `base64:<Base64字符串>` | 适合 `<25KB` 的微型图标或小图 |
-
----
-
-## 三、写给 Gemini 的标准提示词模板 (含强约束指令)
-
-平时需要任何账号下的 Gemini 生成 PNG 图片并存入指定共享文件夹时，直接复制以下提示词即可：
-
-> **标准提示词模板**：
-> 请帮我生成一张【在此描述图片内容】的 PNG 图片，并按以下两步归档到共享文件夹（目标文件夹 ID：`19w2sIfrgC_bgGZRfRzMnebwe1pRjzcm_`，保存文件名：`creative_cat.png`）：
-> 1. 调用 `drive:create_file`（使用 `file://` 路径，**不要填写 `parent_id`**）将该 PNG 图片先上传到我个人网盘的根目录，记录返回的 `file_id`；
-> 2. 打开网盘中的 `GitHub_Task_Queue (外部读写任务队列)`（表格 ID：`1bb8k0iL4HtazsYZFo65ithcxTg21BINO5_RJ5dIdnoE`），在 `Queue` 表末尾追加一行任务：
->    - `status`: `PENDING`
->    - `action`: `COPY_TO_DRIVE`
->    - `method`: `PUT`
->    - `path_or_endpoint`: `19w2sIfrgC_bgGZRfRzMnebwe1pRjzcm_`（或其他目标共享文件夹 ID）
->    - `commit_or_title`: `creative_cat.png`
->    - `payload_json`: `drive:<刚才拿到的file_id>`
+> **提示词模板（零表格写入版）**：
+> 请帮我生成一张【在此描述图片内容】的 PNG 图片，然后直接调用 `drive:create_file`（使用 `file://` 路径，**不要填写 `parent_id`**）将该图片上传到我个人网盘的根目录：
+> - 如果目标是存入 CDS工作室，请将上传的 `title`（文件名）严格命名为：`[TO_CDS] creative_cat.png`
+> - 如果目标是存入其他共享文件夹，请将 `title` 命名为：`[TO_DRIVE_目标文件夹ID] creative_cat.png`
 > 
-> **【强约束执行指令】**：
-> 请直接调用表格编辑工具向电子表格末尾追加该任务行，跳过计划建议（Plan Preview）与二次确认步骤，立即执行写入。
+> 上传完成后直接告诉我就行，**不需要修改或写入任何 Google Sheet 表格**。
 
 ---
 
-## 四、协作者免确认技巧与「建议编辑」卡片说明
+## 二、多账号部署架构说明（为什么建议每个账号部署/复制一份脚本）
 
-1. **为什么协作者账号可能看到建议卡**：
-   目标表格是由主账号创建并共享的。当其他协作者账号的 Gemini 修改他人拥有的共享表格时，Google Workspace 平台的协同审计规则会默认向操作者提示「共享电子表格的建议编辑（更改归属于您）」，以确保操作者知晓该版本记录将以其账号署名。
-2. **强约束指令的作用**：
-   在提示词末尾加上`【强约束执行指令】`，可以明确指示 AI 代理直接执行工具调用，避免其自主进入交互式计划草拟模式。
-3. **如遇建议卡的处理方式**：
-   若特定客户端版本仍渲染了该建议卡，直接点击一次「确认」即可立即写入表格，后台定时器会在 1 分钟内完成文件搬运与归档。
+由于每个 Google 账号的「个人网盘根目录」是相互隔离的（A 账号的脚本无法直接读取 B 账号私人根目录下的未共享文件），且多人共享同一张表格会触发「共享电子表格的建议编辑」卡片，多账号协作时有两种最佳实践：
+
+1. **方案 1（每个账号各自拥有一份私有表格与脚本 —— 最稳妥）**：
+   - 在每个账号（如 `gemini1` ~ `gemini4`）自己的云端硬盘里各自建一份**不对外共享**的 `GitHub_Task_Queue` 表格（或者哪怕不建表格，只在该账号的 [script.google.com](https://script.google.com) 新建一个独立脚本粘贴 `github_task_queue_worker.js` 并运行 `installEveryMinuteTrigger`）。
+   - 这样每个账号的脚本既能直接读取自己网盘根目录下的 `[TO_CDS]` 暂存图片并搬运到 `CDS工作室`，写自己的私有表格时也**绝对不会弹出“共享电子表格”确认卡**。
+2. **方案 2（共用一个中转投递文件夹）**：
+   - 如果只想在主账号跑一个脚本，可以让其他账号把 `[TO_CDS]` 图片或表格放在与主账号共享的缓冲区，但需遵守平台对共享目录的确认机制。因此**方案 1（各账号独立运行触发器 + 模式 A 文件名暗号法）**是体验最丝滑的零点击组合。
+
+---
+
+## 三、模式 B：表格队列法 (`COPY_TO_DRIVE`)
+
+当你在表格所有者账号下操作，或需要通过队列批量调度外部 URL / GitHub Raw 图片时，可在 `Queue` 表追加一行：
+- `action`: `COPY_TO_DRIVE`
+- `method`: `PUT`
+- `path_or_endpoint`: 目标共享文件夹 ID（如 `19w2sIfrgC_bgGZRfRzMnebwe1pRjzcm_`）
+- `commit_or_title`: 保存文件名（如 `creative_cat.png`）
+- `payload_json`: 支持 `drive:<file_id>`（复制后自动清理根目录暂存）、`drive_keep:<file_id>`（保留原文件）、`https://...`（外部图片 URL）或 `draft:<draft_id>`。
